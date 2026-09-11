@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: audio-shield-engine
+    env: docker
+    plan: free
+    region: oregon
+    autoDeploy: true
+    healthCheckPath: /health
