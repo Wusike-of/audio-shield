@@ -133,11 +133,21 @@ async def process_audio(
     try:
         black_ext = Path(black_file.filename or "audio.mp3").suffix or ".mp3"
         black_path = Path(temp_dir) / f"input_black{black_ext}"
-
-        is_wav = export_format.lower() == "wav"
-        out_ext = ".wav" if is_wav else ".mp3"
-        media_type = "audio/wav" if is_wav else "audio/mpeg"
         
+        is_input_video = black_ext.lower() in [".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".ts"]
+        is_mp4_video_export = (export_format.lower() == "mp4") and is_input_video
+        is_wav = export_format.lower() == "wav"
+
+        if is_mp4_video_export:
+            out_ext = ".mp4"
+            media_type = "video/mp4"
+        elif is_wav:
+            out_ext = ".wav"
+            media_type = "audio/wav"
+        else:
+            out_ext = ".mp3"
+            media_type = "audio/mpeg"
+
         raw_name = Path(black_file.filename or "audio").stem
         out_filename = f"{raw_name}_cloaked_shield{out_ext}"
         out_path = Path(temp_dir) / out_filename
@@ -146,7 +156,7 @@ async def process_audio(
             fb.write(await black_file.read())
 
         if black_path.stat().st_size == 0:
-            raise HTTPException(status_code=400, detail="O arquivo de áudio principal está vazio.")
+            raise HTTPException(status_code=400, detail="O arquivo principal está vazio.")
 
         # Áudio White (Disfarce)
         default_white = STATIC_DIR / "disguise_recipe.mp3"
@@ -175,37 +185,58 @@ async def process_audio(
             f"[b_r]volume=-1[b_r_inv];"
             f"[b_l][w_l]amix=inputs=2:weights=1 1:normalize=0:duration=first[out_l];"
             f"[b_r_inv][w_r]amix=inputs=2:weights=1 1:normalize=0:duration=first[out_r];"
-            f"[out_l][out_r]join=inputs=2:channel_layout=stereo:map=0.0-FL|1.0-FR[out]"
+            f"[out_l][out_r]join=inputs=2:channel_layout=stereo:map=0.0-FL|1.0-FR[out_a]"
         )
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(black_path),
-            "-i", str(white_path),
-            "-filter_complex", filtergraph,
-            "-map", "[out]"
-        ]
+        if is_mp4_video_export:
+            # Stream copy dos frames de vídeo (ultra-rápido, ~1s) + áudio camuflado em AAC 320k
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", str(black_path),
+                "-i", str(white_path),
+                "-filter_complex", filtergraph,
+                "-map", "0:v", "-c:v", "copy",
+                "-map", "[out_a]", "-c:a", "aac", "-b:a", "320k",
+                "-shortest",
+                str(out_path)
+            ]
+        elif is_wav:
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", str(black_path),
+                "-i", str(white_path),
+                "-filter_complex", filtergraph,
+                "-map", "[out_a]",
+                "-c:a", "pcm_s32le", "-ar", "44100",
+                str(out_path)
+            ]
+        else: # mp3
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", str(black_path),
+                "-i", str(white_path),
+                "-filter_complex", filtergraph,
+                "-map", "[out_a]",
+                "-c:a", "libmp3lame", "-b:a", "320k", "-ar", "44100",
+                str(out_path)
+            ]
 
-        if is_wav:
-            cmd.extend(["-c:a", "pcm_s32le", "-ar", "44100", str(out_path)])
-        else:
-            cmd.extend(["-c:a", "libmp3lame", "-b:a", "320k", "-ar", "44100", str(out_path)])
-
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
         if res.returncode != 0 or not out_path.exists():
             err_msg = res.stderr[-400:] if res.stderr else "Falha interna no FFmpeg."
             raise HTTPException(status_code=500, detail=f"Erro DSP: {err_msg}")
 
-        # Auditoria automática imediata do áudio recém-gerado
+        # Auditoria automática imediata do áudio/vídeo recém-gerado
         audit = analyze_audio_shield(out_path)
 
         headers = {
-            "Access-Control-Expose-Headers": "X-Audit-Status, X-Audit-Cancellation, X-Audit-Delta, X-Audit-Verdict, X-Audit-Risk",
+            "Access-Control-Expose-Headers": "X-Audit-Status, X-Audit-Cancellation, X-Audit-Delta, X-Audit-Verdict, X-Audit-Risk, X-Output-Type",
             "X-Audit-Status": "PASSED" if audit["is_cloaked"] else "FAILED",
             "X-Audit-Cancellation": str(audit["cancellation_pct"]),
             "X-Audit-Delta": f"{audit['delta_db']} dB",
             "X-Audit-Verdict": "BLINDAGEM CONFIRMADA - RISCO ZERO DE STRIKE" if audit["is_cloaked"] else "DESPROTEGIDO - CANCELAMENTO NAO DETECTADO",
-            "X-Audit-Risk": "0.0% (SEGURO)" if audit["is_cloaked"] else "ALTO RISCO (AUDIO VAZANDO EM MONO)"
+            "X-Audit-Risk": "0.0% (SEGURO)" if audit["is_cloaked"] else "ALTO RISCO (AUDIO VAZANDO EM MONO)",
+            "X-Output-Type": "video" if is_mp4_video_export else "audio"
         }
 
         return FileResponse(
